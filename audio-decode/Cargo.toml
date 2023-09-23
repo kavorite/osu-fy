@@ -1,0 +1,18 @@
+[package]
+name = "audio-decode"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "audio_decode"
+crate-type = ["cdylib"]
+
+[dependencies]
+error-chain = "0.12.4"
+num = "0.4.1"
+numpy = "0.19.0"
+pyo3 = "0.19.0"
+rubato = "0.14.1"
+symphonia = { version = "0.5.3", features = ["all-codecs", "mpa", "mp3"] }
+zip = "0.6.6"
