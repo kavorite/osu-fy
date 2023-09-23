@@ -23,10 +23,10 @@ use error_chain::error_chain;
 error_chain! {
     errors {
         NoAudioFilesFound {
-            display("a supported audio file extension could not be found")
+            display("no supported audio file extensions present in archive")
         }
         UnsupportedCodec {
-            display("a supported audio track could not be found")
+            display("no supported audio tracks present in container")
         }
         UnsupportedSampleFormat(fmt: &'static str) {
             description("unsupported sample format")
@@ -38,18 +38,20 @@ error_chain! {
         Decode(SymphoniaError);
         Resample(rubato::ResampleError);
         Io(std::io::Error);
+        Py(PyErr);
     }
 }
 
 impl Into<PyErr> for Error {
     fn into(self) -> PyErr {
-        match self.kind() {
+        match self.0 {
             ErrorKind::UnsupportedCodec => PyNotImplementedError::new_err(self.to_string()),
             ErrorKind::UnsupportedSampleFormat(_) => {
                 PyNotImplementedError::new_err(self.to_string())
             }
             ErrorKind::Decode(err) => PyValueError::new_err(format!("decode: {err}")),
             ErrorKind::Resample(err) => PyValueError::new_err(format!("resample: {err}")),
+            ErrorKind::Py(err) => err,
             _ => PyValueError::new_err(self.to_string()),
         }
     }
@@ -182,6 +184,8 @@ fn _decode(ext: &str, istrm: MediaSourceStream) -> Result<Vec<f32>> {
             continue;
         }
         if let Some(ref mut resampler) = resampler {
+            let ratio = 48000.0 / packet_spec.rate as f64;
+            resampler.set_resample_ratio(ratio, false)?;
             let mut samples = resampler
                 .process(&[buffer.as_slice()], None)?
                 .into_iter()
@@ -210,7 +214,7 @@ fn extract<'py>(py: Python<'py>, path: &str) -> PyResult<&'py PyArray1<f32>> {
                 })
                 .map(String::from)
                 .map(Ok)
-                .unwrap_or_else(|| Err(ErrorKind::NoAudioFilesFound))?;
+                .unwrap_or(Err(ErrorKind::NoAudioFilesFound))?;
             let mut entry = archive.by_name(name.as_str())?;
             let mut data = Vec::with_capacity(entry.size() as usize);
             std::io::copy(&mut entry, &mut data)?;
