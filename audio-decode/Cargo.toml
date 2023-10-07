@@ -9,10 +9,15 @@ name = "audio_decode"
 crate-type = ["cdylib"]
 
 [dependencies]
+convert_case = "0.6.0"
 error-chain = "0.12.4"
+json-writer = "0.3.0"
 num = "0.4.1"
 numpy = "0.19.0"
+osu-beatmap-parser = "0.14.0"
+osuparse = "2.0.1"
 pyo3 = "0.19.0"
 rubato = "0.14.1"
+soa_derive = "0.13.0"
 symphonia = { version = "0.5.3", features = ["all-codecs", "mpa", "mp3"] }
 zip = "0.6.6"
