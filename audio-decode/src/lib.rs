@@ -15,7 +15,7 @@ use rubato::{
 };
 
 use symphonia::core::{
-    audio::{AudioBuffer, AudioBufferRef},
+    audio::{AudioBuffer, AudioBufferRef, Channels},
     codecs::{Decoder, DecoderOptions, CODEC_TYPE_NULL},
     errors::Error as SymphoniaError,
     formats::{FormatReader, Packet},
@@ -90,6 +90,38 @@ impl Into<PyErr> for Error {
         }
     }
 }
+macro_rules! match_enum_right {
+    (
+        $enum_name:ident {
+            $(
+                $variant:ident,
+            )*
+        }
+    ) => {
+        match $enum_name {
+            $(
+                $enum_name::$variant => {
+                    stringify!($variant).contains("RIGHT")
+                },
+            )*
+        }
+    }
+}
+
+fn phase_shift(channel: Channels) -> f32 {
+    match channel {
+        Channels::FRONT_RIGHT
+        | Channels::FRONT_RIGHT_CENTRE
+        | Channels::FRONT_RIGHT_HIGH
+        | Channels::FRONT_RIGHT_WIDE
+        | Channels::REAR_RIGHT
+        | Channels::REAR_RIGHT_CENTRE
+        | Channels::SIDE_RIGHT
+        | Channels::TOP_FRONT_RIGHT
+        | Channels::TOP_REAR_RIGHT => -1f32,
+        _ => 1f32,
+    }
+}
 
 fn load_mono_buf<S>(src: impl AsRef<AudioBuffer<S>>, dst: &mut [f32])
 where
@@ -97,16 +129,17 @@ where
     f64: From<S>,
 {
     let planes = src.as_ref().planes();
+    let channels = src.as_ref().spec().channels;
     let scale = if S::zero() == S::MID {
         1 << (S::EFF_BITS - 1)
     } else {
         1 << S::EFF_BITS
     } as f64;
     let shift: f64 = S::MID.into();
-    for plane in planes.planes() {
+    for (plane, channel) in planes.planes().iter().zip(channels.iter()) {
         for (i, x) in plane.iter().copied().enumerate() {
             let value: f64 = x.into();
-            dst[i] += ((value - shift) / scale) as f32;
+            dst[i] += phase_shift(channel) * ((value - shift) / scale) as f32;
         }
     }
 }
@@ -119,12 +152,13 @@ fn load_mono(src: &AudioBufferRef, dst: &mut [f32]) {
         S8(src) => load_mono_buf(src, dst),
         S16(src) => load_mono_buf(src, dst),
         S24(src) => {
+            let channels = src.as_ref().spec().channels;
             let planes = src.as_ref().planes();
-            for plane in planes.planes() {
+            for (plane, channel) in planes.planes().iter().zip(channels.iter()) {
                 for (i, value) in plane.iter().copied().enumerate() {
                     let value: f64 = value.0.into();
                     let scale = (1 << 23) as f64;
-                    dst[i] += (value / scale) as f32;
+                    dst[i] += phase_shift(channel) * (value / scale) as f32;
                 }
             }
         }
@@ -132,13 +166,14 @@ fn load_mono(src: &AudioBufferRef, dst: &mut [f32]) {
         U8(src) => load_mono_buf(src, dst),
         U16(src) => load_mono_buf(src, dst),
         U24(src) => {
+            let channels = src.as_ref().spec().channels;
             let planes = src.as_ref().planes();
             let shift: f64 = (1 << 23) as f64;
             let scale = (1 << 24) as f64;
-            for plane in planes.planes() {
+            for (plane, channel) in planes.planes().iter().zip(channels.iter()) {
                 for (i, value) in plane.iter().copied().enumerate() {
                     let value: f64 = value.0.into();
-                    dst[i] += ((value - shift) / scale) as f32;
+                    dst[i] += phase_shift(channel) * ((value - shift) / scale) as f32;
                 }
             }
         }
@@ -549,13 +584,6 @@ fn extract<'py>(py: Python<'py>, path: &str) -> PyResult<(&'py PyArray1<f32>, St
         .allow_threads(|| {
             let file = std::fs::File::open(path)?;
             let mut archive = zip::ZipArchive::new(file)?;
-            // TODO: maybe actually use relative paths given to reference
-            // archived audio files in the beatmap general section ( ? )
-            // There is little risk that audio files will be confused for video
-            // files or go undetected thanks to container extensions and
-            // common conventions held by osu! players, but this is still
-            // 'technically incorrect' (although it does somewhat simplify the
-            // interface and implementation).
             let mut hit_json_string = String::with_capacity(1 << 20);
             let mut audio_path = None;
             let beatmap_names = archive
@@ -582,7 +610,7 @@ fn extract<'py>(py: Python<'py>, path: &str) -> PyResult<(&'py PyArray1<f32>, St
                         Some(audio_path.unwrap_or_else(|| beatmap.general.audio_filename.clone()));
                     if audio_path.as_ref() != Some(&beatmap.general.audio_filename) {
                         let prev = audio_path.unwrap();
-                        let next = beatmap.general.audio_filename;
+                        let next = beatmap.general.audio_filename.as_str();
                         return Err(Error::from_kind(ErrorKind::Py(
                             PyNotImplementedError::new_err(format!(
                                 "mismatched beatmap audio paths {prev} and {next}"
