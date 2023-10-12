@@ -9,6 +9,7 @@ import optax
 from einops import rearrange
 from flax.linen.dtypes import promote_dtype
 
+from istrm import Beatmap, Difficulty
 from S5 import S5Operator
 
 
@@ -90,7 +91,7 @@ class EncoderBlock(nn.Module):
         train = True
         z = u + self.att(u, reset, train)
         y = self.nrm(z + self.ffn(z), r)
-        return (y, r), None
+        return (y, r, s), None
 
 
 # class Mapper(nn.Module):
@@ -124,63 +125,54 @@ class EncoderBlock(nn.Module):
 #        inputs["samples"]
 
 
-class Difficulty(NamedTuple):
-    "Difficulty ratings. All values lie on [0, 10]."
-    circle_size: float
-    approach_rate: float
-    drain_rate: float
-    overall_difficulty: float
-    slider_multiplier: float
-    slider_tick_rate: float
-
-
-class Position(NamedTuple):
-    "Play field position."
-    x: jax.Array
-    y: jax.Array
-
-
-class Beatmap(NamedTuple):
-    positions: jax.Array
-    hit_types: jax.Array
-    durations: jax.Array
-    path_end_mask: jax.Array
-    combo_end_mask: jax.Array
-    difficulty: Difficulty
-
-
 class Mapper(nn.Module):
     width: int = 128
     depth: int = 6
     dtype: jnp.dtype = jnp.bfloat16
+    use_scan: bool = True
 
     @nn.compact
-    def __call__(self, inputs) -> Beatmap:
+    def __call__(self, raw_audio, seq_ids, difficulty_rating, fav_score) -> Beatmap:
         Dense = partial(nn.Dense, dtype=self.dtype)
-        inputs = promote_dtype(inputs, dtype=self.dtype)
-        u = rearrange(
-            inputs["raw_audio"], "... (k d) -> ... k d", k=48
-        )  # 48KHz -> 1KHz
-        r = jnp.stack([inputs["difficulty_rating"], inputs["fav_score"]], axis=-1)
-        u = jax.nn.standardize(u, axis=-1)
-        u = Dense(self.width)(u)
-        for _ in range(self.depth):
-            (u, r), carry = EncoderBlock(self.width, self.depth, dtype=self.dtype)(u, r)
-            del carry
-
-        global_latent = jnp.sum(u * jax.lax.rsqrt(u.shape[-2]), axis=-2)
-        difficulty: Difficulty = 10.0 * jax.nn.relu(
-            Dense(len(Difficulty._fields))(global_latent).swapaxes(0, -1)
+        raw_audio, difficulty_rating, fav_score = promote_dtype(
+            raw_audio, difficulty_rating, fav_score, dtype=self.dtype
         )
-        hit_types = Dense(7)(u)
-        path_end_mask, combo_end_mask = Dense(3)(u).swapaxes(0, -1)
-        positions = jax.nn.tanh(Dense(len(Position._fields))(u).swapaxes(0, -1))
-        durations = jax.nn.relu(Dense(1)(u).squeeze(-1))
+        r = jnp.stack([difficulty_rating, fav_score], axis=-1)
+        s = seq_ids
+        u = jax.nn.standardize(raw_audio, axis=-1)
+        u = Dense(self.width)(u)
+        if self.use_scan:
+            EncoderStack = nn.scan(
+                EncoderBlock,
+                variable_broadcast=False,
+                variable_axes={"params": 0},
+                split_rngs={"params": True},
+                length=self.depth,
+            )
+            (u, r, s), carry = EncoderStack(self.width, self.depth)((u, r, s), None)
+            del carry
+        else:
+            for _ in range(self.depth):
+                (u, r, s), carry = EncoderBlock(
+                    self.width, self.depth, dtype=self.dtype
+                )((u, r, s), None)
+                del carry
+
+        difficulty = jax.nn.tanh(jnp.moveaxis(Dense(len(Difficulty._fields))(u), -1, 0))
+        difficulty = Difficulty(*difficulty)
+        hit_types = Dense(4)(u)
+        slider_types = Dense(4)(u)
+        positions = jax.nn.tanh(Dense(2)(u))
+        scalar_terms = jnp.moveaxis(Dense(4)(u), -1, 0)
+        is_new_timing, is_new_combo, is_new_curve, num_repeats = scalar_terms
+        num_repeats = jnp.maximum(2 ** jax.nn.relu(num_repeats), 1)
         return Beatmap(
             positions,
+            is_new_combo,
+            is_new_curve,
+            is_new_timing,
+            num_repeats,
             hit_types,
-            durations,
-            path_end_mask,
-            combo_end_mask,
+            slider_types,
             difficulty,
         )
