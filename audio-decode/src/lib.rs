@@ -3,8 +3,8 @@ use std::fmt::Write;
 use json_writer::JSONObjectWriter;
 use numpy::{IntoPyArray, PyArray1};
 use osuparse::{
-    DifficultySection, HitCircle, HitObject, HoldNote, MetadataSection, Slider, SliderType,
-    Spinner, TimingPoint,
+    Beatmap, DifficultySection, HitCircle, HitObject, HoldNote, MetadataSection, Slider,
+    SliderType, Spinner, TimingPoint,
 };
 use pyo3::{
     exceptions::{PyNotImplementedError, PyValueError},
@@ -34,7 +34,20 @@ error_chain! {
             display("no .osu files present in archive")
         }
         MissingAudio(file_name: String) {
+            description("no audio files present in archive")
             display("audio file '{file_name}' not present in archive")
+        }
+        TimingPointMissing(file_name: String) {
+            description("first timing point is missing")
+            display("parse '{file_name}': first timing point is missing")
+        }
+        TimingPointInherited(file_name: String) {
+            description("first timing point is inherited")
+            display("parse '{file_name}': first timing point is inherited")
+        }
+        MultipleAudio(file_names: Vec<String>) {
+            description("multiple audio files present in archive")
+            display("expected single audio file, found {file_names:?}")
         }
         UnknownFrames {
             display("length of audio file not found in container")
@@ -45,9 +58,9 @@ error_chain! {
         UnsupportedCodec {
             display("no supported audio tracks present in container")
         }
-        UnsupportedSampleFormat(fmt: &'static str) {
-            description("unsupported sample format")
-            display("unsupported sample format '{fmt:?}'")
+        Beatmap(file_name: String, error: osuparse::Error) {
+            description("invalid beatmap syntax")
+            display("parse '{file_name}': invalid syntax: {error}")
         }
     }
     foreign_links {
@@ -80,30 +93,10 @@ impl Into<PyErr> for Error {
     fn into(self) -> PyErr {
         match self.0 {
             ErrorKind::UnsupportedCodec => PyNotImplementedError::new_err(self.to_string()),
-            ErrorKind::UnsupportedSampleFormat(_) => {
-                PyNotImplementedError::new_err(self.to_string())
-            }
             ErrorKind::Decode(err) => PyValueError::new_err(format!("decode: {err}")),
             ErrorKind::Resample(err) => PyValueError::new_err(format!("resample: {err}")),
             ErrorKind::Py(err) => err,
             _ => PyValueError::new_err(self.to_string()),
-        }
-    }
-}
-macro_rules! match_enum_right {
-    (
-        $enum_name:ident {
-            $(
-                $variant:ident,
-            )*
-        }
-    ) => {
-        match $enum_name {
-            $(
-                $enum_name::$variant => {
-                    stringify!($variant).contains("RIGHT")
-                },
-            )*
         }
     }
 }
@@ -306,7 +299,7 @@ impl MonoStream {
                 let newcap = offset + frames;
                 output.resize(newcap, 0f32);
                 let (_, written) = try_harder!(resampler
-                    .process_partial_into_buffer(Some(&[chunk]), &mut [&mut output[offset..]], None)
+                    .process_into_buffer(&[chunk], &mut [&mut output[offset..]], None)
                     .map(Some)
                     .transpose());
                 output.truncate(offset + written);
@@ -366,18 +359,6 @@ fn _decode(ext: &str, istrm: MediaSourceStream) -> Result<Vec<f32>> {
     while let Some(payload) = stream.consume_next() {
         output.extend_from_slice(payload?.as_slice());
     }
-    // let samples_found = output.len();
-    // if adjusted_sample_count
-    //     .checked_sub(samples_found)
-    //     .unwrap_or(0)
-    //     > 576
-    // {
-    //     Err(Error::from_kind(ErrorKind::Py(PyValueError::new_err(
-    //         format!("end of stream: {samples_found} samples found; {adjusted_sample_count} samples expected"),
-    //     ))))
-    // } else {
-    //     Ok(output)
-    // }
     Ok(output)
 }
 
@@ -578,103 +559,105 @@ fn write_hit_json(
     }
 }
 
+struct Hits {
+    maps: Vec<Beatmap>,
+    json: String,
+}
+
+fn _extract_hits<R: std::io::Read + std::io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+) -> Result<Hits> {
+    let beatmap_names = archive
+        .file_names()
+        .filter(|name| name.ends_with(".osu"))
+        .map(String::from)
+        .collect::<Vec<_>>();
+    if beatmap_names.len() == 0 {
+        return Err(ErrorKind::NoBeatmapFilesFound.into());
+    }
+    let mut json = String::with_capacity(1 << 20);
+    let mut maps = Vec::with_capacity(beatmap_names.len());
+    for name in beatmap_names {
+        let mut entry = archive.by_name(&name)?;
+        let mut data = Vec::with_capacity(entry.size() as usize);
+        std::io::copy(&mut entry, &mut data)?;
+        let mut beatmap = osuparse::parse_beatmap(std::str::from_utf8(&data)?)
+            .map_err(|err| Error::from_kind(ErrorKind::Beatmap(name.clone(), err)))?;
+        beatmap.timing_points.sort_unstable_by(
+            |&TimingPoint { offset: a, .. }, &TimingPoint { offset: b, .. }| a.total_cmp(&b),
+        );
+        let mut timings = beatmap.timing_points.iter().peekable();
+        timings
+            .peek()
+            .map(|point| {
+                if point.inherited {
+                    Ok(())
+                } else {
+                    Err(Error::from_kind(ErrorKind::TimingPointInherited(
+                        name.clone(),
+                    )))
+                }
+            })
+            .unwrap_or_else(|| Err(Error::from_kind(ErrorKind::TimingPointMissing(name))))?;
+
+        let mut carry_timing = timings.next().unwrap();
+        let hits = beatmap.hit_objects.iter().peekable();
+        for hit in hits {
+            let start_time = *match hit {
+                HitObject::HitCircle(HitCircle { time, .. }) => time,
+                HitObject::HoldNote(HoldNote { time, .. }) => time,
+                HitObject::Spinner(Spinner { time, .. }) => time,
+                HitObject::Slider(Slider { time, .. }) => time,
+            } as f32;
+            carry_timing = if timings
+                .peek()
+                .filter(|&TimingPoint { offset, .. }| offset < &start_time)
+                .is_some()
+            {
+                timings.next().unwrap()
+            } else {
+                carry_timing
+            };
+
+            write_hit_json(
+                hit,
+                &beatmap.metadata,
+                &beatmap.difficulty,
+                &carry_timing,
+                &mut json,
+            );
+        }
+        maps.push(beatmap);
+    }
+    Ok(Hits { json, maps })
+}
+
 #[pyfunction]
 fn extract<'py>(py: Python<'py>, path: &str) -> PyResult<(&'py PyArray1<f32>, String)> {
     let (samples, hits_json) = py
         .allow_threads(|| {
             let file = std::fs::File::open(path)?;
             let mut archive = zip::ZipArchive::new(file)?;
-            let mut hit_json_string = String::with_capacity(1 << 20);
-            let mut audio_path = None;
-            let beatmap_names = archive
-                .file_names()
-                .filter(|name| name.ends_with(".osu"))
-                .map(String::from)
+            let Hits { maps, json } = _extract_hits(&mut archive).map_err(|err| {
+                ErrorKind::Py(PyValueError::new_err(format!("extract from {path}: {err}")))
+            })?;
+            let audio_paths = maps
+                .iter()
+                .map(|map| map.general.audio_filename.clone())
                 .collect::<Vec<_>>();
-            if beatmap_names.len() == 0 {
-                return Err(PyValueError::new_err("no .osu files in archive").into());
+            let all_same_audio = audio_paths
+                .as_slice()
+                .windows(2)
+                .fold(true, |acc, wnd| acc && wnd[0] == wnd[1]);
+            if !all_same_audio {
+                return Err(ErrorKind::MultipleAudio(audio_paths).into());
             }
-            {
-                // let mut hit_records = json_writer::JSONArrayWriter::new(&mut hit_json_string);
-                for name in beatmap_names {
-                    let mut entry = archive.by_name(&name)?;
-                    let mut data = Vec::with_capacity(entry.size() as usize);
-                    std::io::copy(&mut entry, &mut data)?;
-                    let mut beatmap = osuparse::parse_beatmap(std::str::from_utf8(&data)?)
-                        .map_err(|err| {
-                            Error::from_kind(ErrorKind::Py(PyValueError::new_err(format!(
-                                "parse beatmap '{path}/{name}': {err}"
-                            ))))
-                        })?;
-                    audio_path =
-                        Some(audio_path.unwrap_or_else(|| beatmap.general.audio_filename.clone()));
-                    if audio_path.as_ref() != Some(&beatmap.general.audio_filename) {
-                        let prev = audio_path.unwrap();
-                        let next = beatmap.general.audio_filename.as_str();
-                        return Err(Error::from_kind(ErrorKind::Py(
-                            PyNotImplementedError::new_err(format!(
-                                "mismatched beatmap audio paths {prev} and {next}"
-                            )),
-                        )));
-                    }
-
-                    beatmap.timing_points.sort_unstable_by(
-                        |&TimingPoint { offset: a, .. }, &TimingPoint { offset: b, .. }| {
-                            a.total_cmp(&b)
-                        },
-                    );
-                    let mut timings = beatmap.timing_points.into_iter().peekable();
-                    timings
-                        .peek()
-                        .map(|point| {
-                            if point.inherited {
-                                Ok(())
-                            } else {
-                                Err(Error::from(PyValueError::new_err(format!(
-                                    "parse {path}/{name}: first timing point inherited"
-                                ))))
-                            }
-                        })
-                        .unwrap_or_else(|| {
-                            Err(Error::from(PyValueError::new_err(format!(
-                                "parse {path}/{name}: first timing point missing"
-                            ))))
-                        })?;
-
-                    let mut carry_timing = timings.next().unwrap();
-                    let hits = beatmap.hit_objects.iter().peekable();
-                    for hit in hits {
-                        let start_time = *match hit {
-                            HitObject::HitCircle(HitCircle { time, .. }) => time,
-                            HitObject::HoldNote(HoldNote { time, .. }) => time,
-                            HitObject::Spinner(Spinner { time, .. }) => time,
-                            HitObject::Slider(Slider { time, .. }) => time,
-                        } as f32;
-
-                        {
-                            carry_timing = if timings
-                                .peek()
-                                .filter(|&TimingPoint { offset, .. }| offset < &start_time)
-                                .is_some()
-                            {
-                                timings.next().unwrap()
-                            } else {
-                                carry_timing
-                            };
-
-                            write_hit_json(
-                                hit,
-                                &beatmap.metadata,
-                                &beatmap.difficulty,
-                                &carry_timing,
-                                &mut hit_json_string,
-                            );
-                        }
-                    }
-                }
-            }
+            let audio_path = audio_paths
+                .into_iter()
+                .next()
+                .map(Ok)
+                .unwrap_or_else(|| Err(ErrorKind::MissingAudio(String::from(path))))?;
             let samples = {
-                let audio_path = audio_path.unwrap();
                 let mut entry = archive
                     .by_name(&audio_path)
                     .chain_err(|| ErrorKind::MissingAudio(audio_path.clone()))?;
@@ -687,7 +670,7 @@ fn extract<'py>(py: Python<'py>, path: &str) -> PyResult<(&'py PyArray1<f32>, St
                 let ext = &lower[lower.len() - 3..];
                 _decode(ext, istrm)
             }?;
-            Ok::<_, Error>((samples, hit_json_string))
+            Ok::<_, Error>((samples, json))
         })
         .map_err(Into::<PyErr>::into)?;
     let samples = samples.into_pyarray(py);
